@@ -492,6 +492,191 @@ def test_items_to_messages_merges_refusal_into_pending_tool_call_message():
     assert assistant.get("tool_calls")
 
 
+def _output_message_item(text: str | None = None, refusal: str | None = None) -> TResponseInputItem:
+    """A same-turn assistant output message carrying text and/or refusal content."""
+    content: list[Any] = []
+    if text is not None:
+        content.append(ResponseOutputText(text=text, type="output_text", annotations=[]))
+    if refusal is not None:
+        content.append(ResponseOutputRefusal(refusal=refusal, type="refusal"))
+    return cast(
+        TResponseInputItem,
+        ResponseOutputMessage(
+            id="42",
+            type="message",
+            role="assistant",
+            status="completed",
+            content=content,
+        ).model_dump(),
+    )
+
+
+def _function_call_output_item() -> TResponseInputItem:
+    return cast(
+        TResponseInputItem,
+        {"type": "function_call_output", "call_id": "abc", "output": "4"},
+    )
+
+
+def test_items_to_messages_merges_every_same_turn_message_into_tool_call_message():
+    """Second and later same-turn messages merge into the pending tool-call
+    assistant message; flushing would emit an assistant message with tool_calls
+    directly followed by another assistant message, which the API rejects."""
+    func_item: ResponseFunctionToolCallParam = {
+        "id": "99",
+        "call_id": "abc",
+        "name": "math",
+        "arguments": "{}",
+        "type": "function_call",
+    }
+    items: list[TResponseInputItem] = [
+        cast(TResponseInputItem, func_item),
+        _output_message_item(text="Let me check the weather."),
+        _output_message_item(text="One moment."),
+        _function_call_output_item(),
+    ]
+
+    messages = Converter.items_to_messages(items)
+
+    assert len(messages) == 2
+    assistant = messages[0]
+    assert assistant["role"] == "assistant"
+    assert assistant["content"] == "Let me check the weather.\nOne moment."
+    tool_calls = assistant.get("tool_calls")
+    assert isinstance(tool_calls, list)
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["function"]["name"] == "math"
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["tool_call_id"] == "abc"
+
+
+def test_items_to_messages_merges_text_after_same_turn_refusal():
+    """A message following a same-turn refusal merges into the same assistant
+    message instead of opening an invalid second one; the refusal is preserved."""
+    func_item: ResponseFunctionToolCallParam = {
+        "id": "99",
+        "call_id": "abc",
+        "name": "math",
+        "arguments": "{}",
+        "type": "function_call",
+    }
+    messages = Converter.items_to_messages(
+        [
+            cast(TResponseInputItem, func_item),
+            _output_message_item(refusal="won't do that"),
+            _output_message_item(text="Actually, here you go."),
+            _function_call_output_item(),
+        ]
+    )
+
+    assert len(messages) == 2
+    assistant = messages[0]
+    assert assistant["refusal"] == "won't do that"
+    assert assistant["content"] == "Actually, here you go."
+    assert assistant.get("tool_calls")
+    assert messages[1]["role"] == "tool"
+
+    # The reverse order (text, then refusal) must merge the same way.
+    reversed_messages = Converter.items_to_messages(
+        [
+            cast(TResponseInputItem, func_item),
+            _output_message_item(text="Let me check."),
+            _output_message_item(refusal="won't do that"),
+            _function_call_output_item(),
+        ]
+    )
+    assert len(reversed_messages) == 2
+    assert reversed_messages[0]["content"] == "Let me check."
+    assert reversed_messages[0]["refusal"] == "won't do that"
+    assert reversed_messages[0].get("tool_calls")
+    assert reversed_messages[1]["role"] == "tool"
+
+
+def test_items_to_messages_keeps_a_later_turn_separate_after_multi_message_tool_turn():
+    """A plain assistant turn after a tool turn with several same-turn messages
+    stays a separate message; only the same turn's text merges."""
+    func_item: ResponseFunctionToolCallParam = {
+        "id": "99",
+        "call_id": "abc",
+        "name": "math",
+        "arguments": "{}",
+        "type": "function_call",
+    }
+    later_turn = cast(
+        TResponseInputItem,
+        ResponseOutputMessage(
+            id="43",
+            type="message",
+            role="assistant",
+            status="completed",
+            content=[ResponseOutputText(text="Done.", type="output_text", annotations=[])],
+        ).model_dump(),
+    )
+    messages = Converter.items_to_messages(
+        [
+            cast(TResponseInputItem, func_item),
+            _output_message_item(text="First."),
+            _output_message_item(text="Second."),
+            _function_call_output_item(),
+            later_turn,
+        ]
+    )
+
+    assert len(messages) == 3
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["content"] == "First.\nSecond."
+    assert messages[0].get("tool_calls")
+    assert messages[1]["role"] == "tool"
+    assert messages[2]["role"] == "assistant"
+    assert messages[2]["content"] == "Done."
+    assert not messages[2].get("tool_calls")
+
+
+def test_items_to_messages_merges_same_turn_messages_after_thinking_blocks():
+    """Same-turn messages following reconstructed thinking blocks append text
+    parts in order instead of opening an invalid second assistant message."""
+    reasoning_item = cast(
+        TResponseInputItem,
+        {
+            "id": "rs_1",
+            "type": "reasoning",
+            "content": [{"type": "reasoning_text", "text": "plan the call"}],
+            "encrypted_content": "SIG-1",
+            "provider_data": {"model": "anthropic/claude-4-opus"},
+        },
+    )
+    func_item: ResponseFunctionToolCallParam = {
+        "id": "99",
+        "call_id": "abc",
+        "name": "math",
+        "arguments": "{}",
+        "type": "function_call",
+    }
+    messages = Converter.items_to_messages(
+        [
+            reasoning_item,
+            cast(TResponseInputItem, func_item),
+            _output_message_item(text="First."),
+            _output_message_item(text="Second."),
+            _function_call_output_item(),
+        ],
+        model="anthropic/claude-4-opus",
+        preserve_thinking_blocks=True,
+    )
+
+    assert len(messages) == 2
+    assistant = messages[0]
+    content = assistant.get("content")
+    assert isinstance(content, list)
+    assert content[0]["type"] == "thinking"
+    assert [part["text"] for part in content if part.get("type") == "text"] == [
+        "First.",
+        "Second.",
+    ]
+    assert assistant.get("tool_calls")
+    assert messages[1]["role"] == "tool"
+
+
 def test_items_to_messages_accepts_statusless_output_message():
     """Output messages remain recognizable after replay normalization removes null status."""
     statusless_message = cast(

@@ -755,34 +755,33 @@ class Converter:
                     else:
                         raise UserError(f"Unknown content type in ResponseOutputMessage: {c}")
 
-                # A streamed turn can order its function calls before its text message,
-                # and the pending assistant message then already carries the tool calls
-                # of this same turn: a function_call_output always flushes, so tool calls
-                # from a previous turn cannot still be pending here. Merge the message
-                # into that pending assistant message. Flushing instead would emit an
-                # assistant message with tool_calls directly followed by another
+                # A streamed turn can order its function calls before its text
+                # messages, and the pending assistant message then already carries
+                # the tool calls of this same turn: a function_call_output always
+                # flushes, so tool calls from a previous turn cannot still be
+                # pending here. Merge every same-turn message, in arrival order,
+                # into that pending assistant message. Flushing instead would emit
+                # an assistant message with tool_calls directly followed by another
                 # assistant message, a sequence the Chat Completions API rejects.
                 pending_content = (
                     current_assistant_msg.get("content")
                     if current_assistant_msg is not None
                     else None
                 )
-                if (
-                    current_assistant_msg is not None
-                    and current_assistant_msg.get("tool_calls")
-                    and "refusal" not in current_assistant_msg
-                    # None is the untouched state; a list means thinking blocks were
-                    # already reconstructed into content parts and text can be appended.
-                    and (pending_content is None or isinstance(pending_content, list))
-                ):
+                if current_assistant_msg is not None and current_assistant_msg.get("tool_calls"):
                     merged_asst = current_assistant_msg
                     if text_segments:
                         combined = "\n".join(text_segments)
                         if isinstance(pending_content, list):
+                            # Thinking blocks were already reconstructed into
+                            # content parts; append the text as another part.
                             merged_asst["content"] = [
                                 *pending_content,
                                 ChatCompletionContentPartTextParam(text=combined, type="text"),
                             ]
+                        elif isinstance(pending_content, str):
+                            # A previous same-turn message already merged its text.
+                            merged_asst["content"] = f"{pending_content}\n{combined}"
                         else:
                             merged_asst["content"] = combined
                     if refusal is not None:
